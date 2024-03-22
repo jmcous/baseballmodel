@@ -1,0 +1,204 @@
+---
+title: "baseballproject"
+author: "jmc"
+date: "2024-03-21"
+output: html_document
+---
+
+
+Here I will load in the data I have generated that has the following columns:
+"index"                      "index_x"                    "HomeTeam_x"                 "AwayTeam_x"                
+ "GameDate_x"                 "GameTime"                   "HomeOPS"                    "AwayOPS"                   
+ "HomewRCPlus"                "AwaywRCPlus"                "HomePitcherName"            "HomeERA"                   
+ "HomePitcherGS"              "AwayPitcherName"            "AwayERA"                    "AwayPitcherGS"             
+ "HomeFIP"                    "AwayFIP"                    "HomexFIP"                   "AwayxFIP"                  
+ "HomeScoreAfter5"            "AwayScoreAfter5"            "HomeTotalScore"             "AwayTotalScore"            
+ "HomePlusDate"               "index_y"                    "event_id"                   "GameDate_y"                
+ "GameTime_x"                 "HomeTeam_y"                 "OpeningHomeOdds"            "HomeOdds"                  
+ "OpeningHomeSpread"          "HomeSpread"                 "GameTime_y"                 "AwayTeam_y"                
+ "OpeningAwayOdds"            "AwayOdds"                   "OpeningAwaySpread"          "AwaySpread"                
+ "OpeningHomeOddsSpreadRatio" "HomeOddsSpreadRatio"        "OpeningAwayOddsSpreadRatio" "AwayOddsSpreadRatio"       
+
+There are a lot of variables I will not be using, so I am going to clean this up and compute three more columns:
+- resultAfter5: where 0 corresponds to a home loss after 5, 0.5 correponds to a tie after 5, and 1 corresponds to a home win.
+- homeFFImpliedProb: The implied probability given by the odds of the home team winning after 5.
+- awayFFImpliedProb: The implied probability given by the odds of the away team winning after 5.
+
+All of the statistics are rolling 30 day team averages. Each batting stat is computed from the 30 day average of each batting lineup as opposed to rolling team average.
+
+All of these statistics were compiled using the Python Jupyter notebook included in this repository.
+
+```{r}
+
+data <- read.csv('adv_stats_plus_spreads_052119_thru_092919_corrected.csv',header=TRUE)
+origdata <- read.csv('adv_stats_plus_spreads_052119_thru_092919_corrected.csv',header=TRUE)
+data$resultAfter5[data$HomeScoreAfter5 > data$AwayScoreAfter5] <- 1
+data$resultAfter5[data$HomeScoreAfter5 < data$AwayScoreAfter5] <- 0
+data$resultAfter5[data$HomeScoreAfter5 == data$AwayScoreAfter5] <- 0.5
+
+
+data$homeFFImpliedProb <- 1/data$HomeOdds 
+data$awayFFImpliedProb <- 1/data$AwayOdds 
+```
+
+Next I am going to define the columns I will need for this logistic regression model and filter the data to only include games where the home and away starting pitchers have started at least 5 games in the last 30 days.
+
+```{r}
+
+predictors <- c("HomeOPS","AwayOPS","HomewRCPlus","AwaywRCPlus",
+                "HomeERA","AwayERA","HomeFIP","AwayFIP","HomexFIP","AwayxFIP",
+                "homeFFImpliedProb","awayFFImpliedProb","resultAfter5")
+
+data <- data[data$HomePitcherGS > 4,]
+data <- data[data$AwayPitcherGS > 4,]
+
+data <- data[,predictors]
+
+```
+
+The next step is to divide the data into train and test sets. We will also be performing principcal component analysis on this data, and taking the top 8 principal components.
+
+```{r}
+
+scaled_data <- scale(data[,-13])
+datapca <- prcomp(scaled_data)
+
+screeplot(datapca,type="lines")
+
+set.seed(22)
+idx <- sample(1:10,dim(data)[1],replace=TRUE)
+pcdata4lm <- as.data.frame(cbind(datapca$x[,1:8],data[,13]))
+
+scaleDataTest <- pcdata4lm[idx > 8,]
+scaleDataTrain <- pcdata4lm[idx <= 8,]
+dataTest <- data[idx > 8,]
+dataTrain <- data[idx <= 8,]
+
+```
+In the following code block, the top 8 principal components are used in training a cross-validated logistic regression model. Those results are put in an array labeled pResultAfter5.
+```{r}
+
+set.seed(22)
+
+
+library(glmnet)
+model <- cv.glmnet(as.matrix(scaleDataTrain[,-9]),
+            as.matrix(scaleDataTrain[,9]),
+            nfolds=10,
+            standardize = TRUE)
+
+summary(model)
+
+pResultAfter5 <- predict(model, as.matrix(scaleDataTest[,-9]),s="lambda.min")
+ResultAfter5 <- scaleDataTest[,9]
+
+```
+
+```{r}
+
+
+newDataTest <- cbind(dataTest,pResultAfter5)
+newDataTest$sub <- newDataTest$lambda.min - newDataTest$homeFFImpliedProb
+newDataTest$EV_home <- (newDataTest$lambda.min * ((1/newDataTest$homeFFImpliedProb)*100)) - ((1-newDataTest$lambda.min)*100)
+newDataTest$EV_away <- ((1-newDataTest$lambda.min) * ((1/newDataTest$awayFFImpliedProb)*100)) - ((1-(1-newDataTest$lambda.min))*100)
+newDataTest$EV_diff <- newDataTest$EV_home - newDataTest$EV_away
+
+
+```
+Calculated above is the expected value for wagering on the home team or the away team. Below I will compute my bankroll starting with \$1000 and \$100 units and wagering on games that have an absolute value of expected value difference of 20 or greater. When the expected value difference is 40 or greater, I will use $200 as my units.
+
+```{r}
+
+# Initialize bankroll and unit size
+bankroll <- 1000
+games_wagered <- 0
+# Loop through each row of the data table
+for (i in 1:nrow(newDataTest)) {
+  
+  if (abs(newDataTest$EV_diff[i]) >= 20) {
+    games_wagered <- games_wagered + 1
+    
+    unit_size <- 100
+
+    if (abs(newDataTest$EV_diff[i]) >= 40){
+      unit_size <- 200
+    }
+    
+    
+    if (newDataTest$EV_home[i] > newDataTest$EV_away[i]) {
+      # Bet on home team
+      if (newDataTest$resultAfter5[i] == 1) {
+        # Home team won, add unit size to bankroll
+        bankroll <- bankroll + (1 / newDataTest$homeFFImpliedProb[i] - 1) * unit_size
+        # print('win')
+      } else {
+        # Home team lost, subtract unit size from bankroll
+        bankroll <- bankroll - unit_size
+        # print('loss')
+      }
+    } else {
+      # Bet on away team
+      if (newDataTest$resultAfter5[i] == 0) {
+        bankroll <- bankroll + (1 / newDataTest$awayFFImpliedProb[i] - 1) * unit_size
+        # print('win')
+      } else {
+        bankroll <- bankroll - unit_size
+        # print('loss')
+      }
+    }
+  }
+}
+
+# Print final bankroll
+print(bankroll)
+print(games_wagered)
+
+```
+Over 72 games that were wagered on, the model returns a profit of \$342 when starting with a \$1000 bankroll.
+
+I have also included functions below that will be useful when presented with data that we need to fit into the framework of this model, i.e. using the variables needed in terms of the principal components that my model uses.
+
+```{r}
+descale_coefficients <- function (coeff, scale_params){
+  # descale coefficients acquired from linear regression model
+  dsc_coeff <- vector("numeric",length(coeff))
+  for (i in 1:length(coeff)){
+    dsc_coeff[i] <- (t_coeff[i]/scale_params$sd[i])
+  }
+  return(dsc_coeff)
+  
+}
+
+pca2origcoeff <- function(pca_data, lm) {
+  # transform pca coefficients back to scaled data coefficients
+  t_coeff <- vector("numeric",dim(pca_data$rotation)[1])
+  for (j in 1:dim(pca_data$rotation)[1]){
+    for (k in 1:(length(lm$coefficients)-1)){
+      t_coeff[j] <- t_coeff[j] + (lm$coefficients[k+1]*pca_data$rotation[j,k])
+    }
+    
+  }
+  return(t_coeff)
+}
+
+jscale <- function(df){
+  
+  scaler <- list()
+  
+  scaler$center <- colMeans(df)
+  scaler$sd <- numeric(ncol(df))
+  
+  for (i in 1:dim(df)[2]){
+    scaler$sd[i] <- sd(df[,i])
+    
+  }
+  
+  names(scaler$sd) <- colnames(df)
+  
+  
+  return(scaler)
+  
+}
+
+
+```
